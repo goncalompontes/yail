@@ -57,6 +57,19 @@ if (YAIL_BUILD_EXAMPLES)
     # /SUBSYSTEM:WINDOWS makes the linker pick WinMainCRTStartup as the entry,
     # which the CRT uses to dispatch to WinMain (instead of main).
     target_link_options(test_winexe PRIVATE /SUBSYSTEM:WINDOWS /DELAYLOAD:dbghelp.dll)
+
+    # Self-unmap test targets
+    add_executable(test_host examples/test_host.cpp)
+    set_target_properties(test_host PROPERTIES CXX_STANDARD 23)
+
+    add_library(test_unload_dll MODULE examples/test_unload_dll.cpp)
+    set_target_properties(test_unload_dll PROPERTIES CXX_STANDARD 23)
+    target_link_libraries(test_unload_dll PRIVATE yail dbghelp winmm delayimp)
+    target_link_options(test_unload_dll PRIVATE /DELAYLOAD:dbghelp.dll /DELAYLOAD:winmm.dll)
+
+    add_executable(test_cycle examples/test_cycle.cpp)
+    set_target_properties(test_cycle PROPERTIES CXX_STANDARD 23)
+    target_link_libraries(test_cycle PRIVATE yail)
 endif()
 
 
