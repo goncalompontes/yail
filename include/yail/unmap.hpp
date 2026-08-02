@@ -177,6 +177,27 @@ namespace yail
 
         [[noreturn]] inline void self_unmap(void* base)
         {
+            auto unmap_log = [](const char *msg) {
+                char path[MAX_PATH]{};
+                if (!GetTempPathA(sizeof(path), path)) return;
+                lstrcatA(path, "cs2_internal.log");
+                HANDLE h = CreateFileA(path, FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    DWORD w{};
+                    DWORD len = 0; while (msg[len]) ++len;
+                    SYSTEMTIME st{}; GetLocalTime(&st);
+                    char ts[32]; int tsl = wsprintfA(ts, "[%02d:%02d:%02d.%03d] ",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                    WriteFile(h, ts, tsl, &w, nullptr);
+                    WriteFile(h, msg, len, &w, nullptr);
+                    WriteFile(h, "\r\n", 2, &w, nullptr);
+                    CloseHandle(h);
+                }
+            };
+
+            unmap_log("self_unmap: start");
             const auto* dos = static_cast<const IMAGE_DOS_HEADER*>(base);
             const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
                 static_cast<const uint8_t*>(base) + dos->e_lfanew);
@@ -185,28 +206,34 @@ namespace yail
             // 1. DllMain(DLL_PROCESS_DETACH)
             if (is_dll && nt->OptionalHeader.AddressOfEntryPoint)
             {
+                unmap_log("self_unmap: calling DllMain(DETACH)...");
                 auto ep = reinterpret_cast<BOOL(WINAPI*)(HMODULE, DWORD, LPVOID)>(
                     static_cast<uint8_t*>(base) + nt->OptionalHeader.AddressOfEntryPoint);
                 ep(static_cast<HMODULE>(base), DLL_PROCESS_DETACH, nullptr);
+                unmap_log("self_unmap: DllMain(DETACH) returned");
+            } else {
+                unmap_log("self_unmap: no entry point, skipping DllMain");
             }
 
-            // 2. TLS callbacks(DLL_PROCESS_DETACH)
+            // 2. TLS callbacks(DLL_PROCESS_DETACH) — skip: DllMain(DETACH)
+            // already ran CRT static destructors which tear down TLS.
+            // Calling callbacks again dereferences freed CRT state → crash.
             const auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-            if (tls_dir.Size)
-            {
-                auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(
-                    static_cast<const uint8_t*>(base) + tls_dir.VirtualAddress);
-                auto* cbs = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks);
-                for (; cbs && *cbs; ++cbs)
-                    (*cbs)(base, DLL_PROCESS_DETACH, nullptr);
-            }
+            unmap_log("self_unmap: TLS callbacks skipped (DllMain already handled DETACH)");
 
             // 3. RtlRemoveInvertedFunctionTable
-            if (auto* fn = find_rtl_remove_inverted_function_table())
+            unmap_log("self_unmap: scanning for RtlRemoveInvertedFunctionTable...");
+            if (auto* fn = find_rtl_remove_inverted_function_table()) {
+                unmap_log("self_unmap: calling RtlRemoveInvertedFunctionTable...");
                 reinterpret_cast<RtlRemoveInvertedFunctionTableFn>(fn)(base);
+                unmap_log("self_unmap: RtlRemoveInvertedFunctionTable returned");
+            } else {
+                unmap_log("self_unmap: RtlRemoveInvertedFunctionTable NOT FOUND (pattern miss)");
+            }
 
             // 4. LdrpReleaseTlsEntry — use the persistent heap pointer
             // stashed by the injection shellcode at base + sizeof(IMAGE_DOS_HEADER).
+            unmap_log("self_unmap: scanning for LdrpReleaseTlsEntry...");
             if (auto* fn = find_ldrp_release_tls_entry())
             {
                 auto** stash = reinterpret_cast<LdrDataTableEntryFull**>(
@@ -214,6 +241,7 @@ namespace yail
 
                 if (tls_dir.Size && *stash)
                 {
+                    unmap_log("self_unmap: calling LdrpReleaseTlsEntry...");
                     reinterpret_cast<LdrpReleaseTlsEntryFn>(fn)(*stash, nullptr);
 
                     // Free the persistent heap allocation.
@@ -223,14 +251,21 @@ namespace yail
                             GetProcAddress(ntdll, "RtlFreeHeap"));
                     if (rtlFree)
                         rtlFree(heap, 0, *stash);
+                    unmap_log("self_unmap: LdrpReleaseTlsEntry + heap free done");
+                } else {
+                    unmap_log("self_unmap: TLS stash empty, skipping release");
                 }
+            } else {
+                unmap_log("self_unmap: LdrpReleaseTlsEntry NOT FOUND (pattern miss)");
             }
 
             // 5. Free and exit
+            unmap_log("self_unmap: getting NtFreeVirtualMemory + RtlExitUserThread...");
             auto* ntdll = GetModuleHandleA("ntdll.dll");
             auto* ntfv = GetProcAddress(ntdll, "NtFreeVirtualMemory");
             auto* reut = GetProcAddress(ntdll, "RtlExitUserThread");
             if (!ntfv || !reut) __fastfail(2);
+            unmap_log("self_unmap: calling invoke_trampoline (this is the last log)");
             invoke_trampoline(base, ntfv, reut);
         }
     } // namespace detail_unmap
