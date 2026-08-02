@@ -27,11 +27,15 @@ namespace yail::detail
 #ifdef _WIN64
         using LdrpHandleTlsDataFn = NTSTATUS(NTAPI*)(LdrDataTableEntryFull*);
         using RtlInsertInvertedFunctionTableFn = void(NTAPI*)(PVOID image_base, ULONG size_of_image);
+        using RtlRemoveInvertedFunctionTableFn = void(NTAPI*)(PVOID image_base);
+        using LdrpReleaseTlsEntryFn = NTSTATUS(NTAPI*)(LdrDataTableEntryFull*, PVOID);
 #else
         // Modern x86 ntdll uses __fastcall for these internal functions despite the
         // legacy `_Name@N` symbol decoration - args come in ECX/EDX, not on the stack.
         using LdrpHandleTlsDataFn = NTSTATUS(__fastcall*)(LdrDataTableEntryFull*);
         using RtlInsertInvertedFunctionTableFn = void(__fastcall*)(PVOID image_base, ULONG size_of_image);
+        using RtlRemoveInvertedFunctionTableFn = void(__fastcall*)(PVOID image_base);
+        using LdrpReleaseTlsEntryFn = NTSTATUS(__fastcall*)(LdrDataTableEntryFull*, PVOID);
 #endif
         // The shellcode reference implementation used for regeneration lives in tools/generate_shellcode.cpp.
     } // namespace
@@ -83,5 +87,57 @@ namespace yail::detail
         }
 
         return std::unexpected("Failed to find RtlInsertInvertedFunctionTable");
+    }
+
+    std::expected<void*, std::string> find_rtl_remove_inverted_function_table()
+    {
+        constexpr std::array signatures = {
+#ifdef _WIN64
+            // Verified on Windows 11 24H2/25H2.
+            "48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 48 83 EC ? 48 8B FA",
+            "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 8B FA",
+            "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B",
+#else
+            // Verified on Windows 11 24H2 x86 ntdll (__fastcall).
+            "8B FF 56 68 ? ? ? ? 8B F1 E8 ? ? ? ? 8B D6 E8", // Win11
+            "8B FF 51 56 57 BF ? ? ? ? 8B F1 57 E8 ? ? ? ?", // Win10 newer
+            "8B FF 53 56 57 68 ? ? ? ? 8B D9 E8 ? ? ? ? 8B 35", // Win10 older
+#endif
+        };
+
+        const auto* ntdll = GetModuleHandleA("ntdll.dll");
+        for (const auto* sig : signatures)
+        {
+            if (const auto result = omath::PePatternScanner::scan_for_pattern_in_loaded_module(ntdll, sig))
+                return reinterpret_cast<void*>(result.value());
+        }
+
+        return std::unexpected("Failed to find RtlRemoveInvertedFunctionTable");
+    }
+
+    std::expected<void*, std::string> find_ldrp_release_tls_entry()
+    {
+        constexpr std::array signatures = {
+#ifdef _WIN64
+            // Verified on Windows 11 24H2/25H2.
+            "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B 41 ? 48 8B",
+            "48 8B C4 48 89 58 ? 48 89 70 ? 57 48 83 EC ? 48 8B 41",
+            "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 48 8B",
+#else
+            // x86 patterns — best effort, may need per-build updates.
+            "8B FF 55 8B EC 51 56 8B 75 ? 57 8B",
+            "8B FF 55 8B EC 83 EC ? 53 56 8B 75 ? 57 8B",
+            "55 8B EC 83 EC ? 53 56 8B 75 ? 57 8B",
+#endif
+        };
+
+        const auto* ntdll = GetModuleHandleA("ntdll.dll");
+        for (const auto* sig : signatures)
+        {
+            if (const auto result = omath::PePatternScanner::scan_for_pattern_in_loaded_module(ntdll, sig))
+                return reinterpret_cast<void*>(result.value());
+        }
+
+        return std::unexpected("Failed to find LdrpReleaseTlsEntry");
     }
 }

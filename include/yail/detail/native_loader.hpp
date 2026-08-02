@@ -31,4 +31,10 @@ namespace yail::detail
 
     [[nodiscard]]
     std::expected<void*, std::string> find_rtl_insert_inverted_function_table();
+
+    [[nodiscard]]
+    std::expected<void*, std::string> find_rtl_remove_inverted_function_table();
+
+    [[nodiscard]]
+    std::expected<void*, std::string> find_ldrp_release_tls_entry();
 }

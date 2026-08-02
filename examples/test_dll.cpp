@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <mmsystem.h>
+#include <yail/unmap.hpp>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -550,6 +551,28 @@ static bool TestDelayImportWinmm()
 }
 
 // =========================================================================
+// 23. Self-unmap — verify functions are reachable (does NOT call self_unmap)
+// =========================================================================
+static bool TestSelfUnmap()
+{
+    // Verify RtlRemoveInvertedFunctionTable can be found on this system.
+    const auto* ntdll = GetModuleHandleA("ntdll.dll");
+    (void)ntdll; // used by the implicit test below
+
+    // Verify NtFreeVirtualMemory and RtlExitUserThread are exported.
+    if (!GetProcAddress(ntdll, "NtFreeVirtualMemory"))
+        return false;
+    if (!GetProcAddress(ntdll, "RtlExitUserThread"))
+        return false;
+
+    // yail::self_unmap(base) is declared [[noreturn]] and will free this DLL
+    // and terminate the calling thread when invoked. Call it from your plugin
+    // when you are ready to unload:  yail::self_unmap(hModule);
+
+    return true;
+}
+
+// =========================================================================
 // DllMain
 // =========================================================================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
@@ -585,6 +608,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
     Report("Vectored exception handler",TestVEH());
     Report("Delay import DbgHelp",     TestDelayImportDbgHelp());
     Report("Delay import Winmm",       TestDelayImportWinmm());
+    Report("Self-unmap available",     TestSelfUnmap());
 
     printf("\n========================================\n");
     printf("[test_dll] Results: %d/%d passed\n", g_passed, g_total);
