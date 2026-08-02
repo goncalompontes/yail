@@ -165,9 +165,51 @@ namespace yail
             return nullptr;
         }
 
-        // ---- Accessors: three-tier resolution ----
+        // ---- Call-tracing (tracks E8 CALL rel32 from exported functions) ----
+        // On x64: target = call_instr + 5 + *(int32*)(call_instr + 1)
 
-        // Working pattern for RtlInsertInvertedFunctionTable (from yail native_loader.cpp).
+        inline const uint8_t* resolve_call_target(const uint8_t* call)
+        {
+            if (!call || call[0] != 0xE8) return nullptr;
+            const auto disp = *reinterpret_cast<const int32_t*>(call + 1);
+            return call + 5 + disp;
+        }
+
+        inline bool is_ntdll_prologue(const uint8_t* p)
+        {
+            if (!p) return false;
+            if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0xC4) return true;
+            if (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xDC) return true;
+            if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x5C) return true;
+            return false;
+        }
+
+        inline void* trace_call_from(const char* export_name, int nth_call = 1)
+        {
+            auto* ntdll = GetModuleHandleA("ntdll.dll");
+            if (!ntdll) return nullptr;
+            auto* base = reinterpret_cast<const uint8_t*>(GetProcAddress(ntdll, export_name));
+            if (!base) return nullptr;
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const uint8_t*>(ntdll) + dos->e_lfanew);
+            const auto* mod_end = reinterpret_cast<const uint8_t*>(ntdll) + nt->OptionalHeader.SizeOfImage;
+            int found = 0;
+            for (int off = 0; off < 0x800; ++off)
+            {
+                const auto* instr = base + off;
+                if (instr[0] != 0xE8) continue;
+                auto* target = resolve_call_target(instr);
+                if (!target || target < reinterpret_cast<const uint8_t*>(ntdll) || target >= mod_end)
+                    continue;
+                if (!is_ntdll_prologue(target)) continue;
+                if (++found == nth_call) return const_cast<uint8_t*>(target);
+            }
+            return nullptr;
+        }
+
+        // ---- Accessors: multi-tier resolution ----
+
         inline void* find_insert_func()
         {
             auto* ntdll = GetModuleHandleA("ntdll.dll");
@@ -241,6 +283,12 @@ namespace yail
                 }
             }
 
+            // Tier 4: trace E8 calls from LdrUnloadDll (exported) to find
+            // RtlRemoveInvertedFunctionTable, which is called during DLL unload.
+            for (int n = 1; n <= 5; ++n)
+                if (auto* r = trace_call_from("LdrUnloadDll", n))
+                    return r;
+
             return find_symbol_in_ntdll("RtlRemoveInvertedFunctionTable");
         }
 
@@ -269,6 +317,12 @@ namespace yail
                     if (auto* r = scanner::find_in_module(ntdll, s))
                         return r;
             }
+
+            // Tier 3: trace E8 calls from LdrUnloadDll (exported, unload path).
+            // Try later call indices since remove table is found early.
+            for (int n = 6; n <= 20; ++n)
+                if (auto* r = trace_call_from("LdrUnloadDll", n))
+                    return r;
 
             return find_symbol_in_ntdll("LdrpReleaseTlsEntry");
         }
