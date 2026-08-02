@@ -1,16 +1,17 @@
 #pragma once
 #include <Windows.h>
 #include <winternl.h>
+#include <DbgHelp.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace yail
 {
     namespace detail_unmap
     {
-        // LDR_DATA_TABLE_ENTRY subset — only what LdrpReleaseTlsEntry reads.
         struct LdrDataTableEntryFull final
         {
             LIST_ENTRY in_load_order_links;
@@ -36,7 +37,7 @@ namespace yail
         using LdrpReleaseTlsEntryFn = NTSTATUS(__fastcall*)(LdrDataTableEntryFull*, PVOID);
 #endif
 
-        // ---- Minimal pattern scanner (no omath dependency) ----
+        // ---- Minimal pattern scanner ----
 
         namespace scanner
         {
@@ -44,26 +45,15 @@ namespace yail
             {
                 for (; *pattern; ++data)
                 {
-                    if (*pattern == ' ')
-                    {
-                        ++pattern;
-                        continue;
-                    }
-                    if (*pattern == '?')
-                    {
-                        pattern += (*pattern == '?') ? 1 : 0;
-                        continue;
-                    }
-                    const char high_nibble = *pattern++;
-                    const char low_nibble = *pattern++;
-                    if (!high_nibble || !low_nibble)
-                        return false;
-                    const auto expected =
-                            static_cast<uint8_t>(((high_nibble >= 'A' ? high_nibble - 'A' + 10 : high_nibble - '0')
-                                                  << 4)
-                                                 | (low_nibble >= 'A' ? low_nibble - 'A' + 10 : low_nibble - '0'));
-                    if (*data != expected)
-                        return false;
+                    if (*pattern == ' ') { ++pattern; continue; }
+                    if (*pattern == '?') { ++pattern; continue; }
+                    const char hi = *pattern++;
+                    const char lo = *pattern++;
+                    if (!hi || !lo) return false;
+                    const auto expected = static_cast<uint8_t>(
+                        ((hi >= 'A' ? hi - 'A' + 10 : hi - '0') << 4) |
+                        (lo >= 'A' ? lo - 'A' + 10 : lo - '0'));
+                    if (*data != expected) return false;
                 }
                 return true;
             }
@@ -73,11 +63,8 @@ namespace yail
                 std::size_t len = 0;
                 for (; *pattern; ++pattern)
                 {
-                    if (*pattern == ' ')
-                        continue;
-                    if (*pattern == '?')
-                        continue;
-                    ++pattern; // skip second nibble char
+                    if (*pattern == ' ' || *pattern == '?') continue;
+                    ++pattern;
                     ++len;
                 }
                 return len;
@@ -85,282 +72,363 @@ namespace yail
 
             inline void* find_in_module(HMODULE mod, const char* pattern)
             {
-                if (!mod || !pattern || !*pattern)
-                    return nullptr;
-
-                const auto pattern_len = pattern_length(pattern);
-                if (pattern_len == 0)
-                    return nullptr;
+                if (!mod || !pattern || !*pattern) return nullptr;
+                const auto plen = pattern_length(pattern);
+                if (!plen) return nullptr;
 
                 const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
-                if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-                    return nullptr;
-
+                if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
                 const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-                        reinterpret_cast<const uint8_t*>(mod) + dos->e_lfanew);
-                if (nt->Signature != IMAGE_NT_SIGNATURE)
-                    return nullptr;
+                    reinterpret_cast<const uint8_t*>(mod) + dos->e_lfanew);
+                if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
 
                 const auto* section = IMAGE_FIRST_SECTION(nt);
                 for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
                 {
-                    char name[9]{};
-                    std::memcpy(name, section->Name, 8);
-                    if (std::strcmp(name, ".text") != 0)
-                        continue;
-
-                    const auto* begin =
-                            reinterpret_cast<const uint8_t*>(mod) + section->VirtualAddress;
-                    const auto* end = begin + section->Misc.VirtualSize - pattern_len;
-
-                    for (const auto* cursor = begin; cursor <= end; ++cursor)
-                    {
-                        if (pattern_match(cursor, pattern))
-                            return const_cast<uint8_t*>(cursor);
-                    }
+                    char name[9]{}; std::memcpy(name, section->Name, 8);
+                    if (std::strcmp(name, ".text") != 0) continue;
+                    const auto* begin = reinterpret_cast<const uint8_t*>(mod) + section->VirtualAddress;
+                    const auto* end = begin + section->Misc.VirtualSize - plen;
+                    for (const auto* cur = begin; cur <= end; ++cur)
+                        if (pattern_match(cur, pattern))
+                            return const_cast<uint8_t*>(cur);
                     break;
                 }
                 return nullptr;
             }
         } // namespace scanner
 
-        // ---- Signature scanning for unload functions ----
+        // ---- Internal-pattern + walk-backwards finder (NimRunPE/Blackbone technique) ----
+        // Finds a pattern inside the function body, then walks backwards through
+        // 0xCC alignment padding to find the actual function prologue.
+
+        inline void* find_func_by_internal_pattern(const char* pattern)
+        {
+            auto* ntdll = GetModuleHandleA("ntdll.dll");
+            if (!ntdll) return nullptr;
+            const auto plen = scanner::pattern_length(pattern);
+            if (!plen) return nullptr;
+
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const uint8_t*>(ntdll) + dos->e_lfanew);
+
+            const auto* section = IMAGE_FIRST_SECTION(nt);
+            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
+            {
+                char name[9]{}; std::memcpy(name, section->Name, 8);
+                if (std::strcmp(name, ".text") != 0) continue;
+                const auto* begin = reinterpret_cast<const uint8_t*>(ntdll) + section->VirtualAddress;
+                const auto* end = begin + section->Misc.VirtualSize - plen;
+
+                for (const auto* cur = begin; cur <= end; ++cur)
+                {
+                    if (!scanner::pattern_match(cur, pattern)) continue;
+                    const auto* func = cur;
+                    for (int step = 0; step < 0x200 && func > begin; ++step)
+                    {
+                        --func;
+                        if (*func != 0xCC) break;
+                    }
+                    return const_cast<uint8_t*>(func);
+                }
+                break;
+            }
+            return nullptr;
+        }
+
+        // ---- PDB fallback ----
+
+        inline void* find_symbol_in_ntdll(const char* name)
+        {
+            const HMODULE dbghelp = LoadLibraryA("DbgHelp.dll");
+            if (!dbghelp) return nullptr;
+            auto pSymInit = reinterpret_cast<BOOL(WINAPI*)(HANDLE, PCSTR, BOOL)>(
+                GetProcAddress(dbghelp, "SymInitialize"));
+            auto pSymName = reinterpret_cast<BOOL(WINAPI*)(HANDLE, PCSTR, PSYMBOL_INFO)>(
+                GetProcAddress(dbghelp, "SymFromName"));
+            auto pSymSetPath = reinterpret_cast<BOOL(WINAPI*)(HANDLE, PCWSTR)>(
+                GetProcAddress(dbghelp, "SymSetSearchPathW"));
+            if (!pSymName || !pSymInit) return nullptr;
+            pSymInit(GetCurrentProcess(), nullptr, FALSE);
+            if (pSymSetPath)
+                pSymSetPath(GetCurrentProcess(),
+                            L"srv*C:\\symbols*https://msdl.microsoft.com/download/symbols");
+            char buf[256];
+            snprintf(buf, sizeof(buf), "ntdll!%s", name);
+            alignas(SYMBOL_INFO) uint8_t sbuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+            auto* sym = reinterpret_cast<SYMBOL_INFO*>(sbuf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = MAX_SYM_NAME;
+            if (pSymName(GetCurrentProcess(), buf, sym))
+                return reinterpret_cast<void*>(sym->Address);
+            return nullptr;
+        }
+
+        // ---- Accessors: three-tier resolution ----
+
+        // Working pattern for RtlInsertInvertedFunctionTable (from yail native_loader.cpp).
+        inline void* find_insert_func()
+        {
+            auto* ntdll = GetModuleHandleA("ntdll.dll");
+            constexpr std::array<const char*, 3> sigs = {
+                "48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 48 83 EC ? 83 60",
+                "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 8B FA",
+                "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC",
+            };
+            for (const auto* s : sigs)
+                if (auto* r = scanner::find_in_module(ntdll, s))
+                    return r;
+            return nullptr;
+        }
 
         inline void* find_rtl_remove_inverted_function_table()
         {
-            constexpr std::array<const char*, 6> signatures = {
-#ifdef _WIN64
-                // Verified on Windows 11 24H2/25H2.
-                "48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 48 83 EC ? 48 8B FA",
-                "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 8B FA",
-                "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B",
-#else
-                // Verified on Windows 11 24H2 x86 ntdll (__fastcall).
-                "8B FF 56 68 ? ? ? ? 8B F1 E8 ? ? ? ? 8B D6 E8",
-                "8B FF 51 56 57 BF ? ? ? ? 8B F1 57 E8 ? ? ? ?",
-                "8B FF 53 56 57 68 ? ? ? ? 8B D9 E8 ? ? ? ? 8B 35",
-#endif
-            };
-
             auto* ntdll = GetModuleHandleA("ntdll.dll");
-            for (const auto* sig : signatures)
+            if (!ntdll) return nullptr;
+
+            // Tier 1: internal pattern from RtlpRemoveInvertedFunctionTable search loop
+            // (cmp ImageBase against table entry)
             {
-                if (auto* result = scanner::find_in_module(ntdll, sig))
-                    return result;
+                constexpr const char* internal_sigs[] = {
+                    "48 8B 4B ? 48 39 01 75",
+                    "48 3B D8 75 ? 48 8B",
+                    "4C 39 ? ? ? 75 ? 48 8B",
+                };
+                for (const auto* s : internal_sigs)
+                    if (auto* r = find_func_by_internal_pattern(s))
+                        return r;
             }
-            return nullptr;
+
+            // Tier 2: standard prologue patterns in .text
+            {
+                constexpr std::array<const char*, 5> sigs = {
+                    "48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 48 83 EC ? 48 8B FA",
+                    "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 8B FA",
+                    "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B",
+                    "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 33",
+                    "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B",
+                };
+                for (const auto* s : sigs)
+                    if (auto* r = scanner::find_in_module(ntdll, s))
+                        return r;
+            }
+
+            // Tier 3: find insert function (known working), scan nearby
+            if (auto* insert = find_insert_func())
+            {
+                constexpr std::array<const char*, 3> nearby = {
+                    "48 89 5C 24 ? 57 48 83 EC ? 48 8B",
+                    "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC",
+                };
+                for (const auto* s : nearby)
+                {
+                    const auto plen = scanner::pattern_length(s);
+                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                        reinterpret_cast<const uint8_t*>(ntdll) + dos->e_lfanew);
+                    const auto* mod_end = reinterpret_cast<const uint8_t*>(ntdll)
+                                          + nt->OptionalHeader.SizeOfImage;
+                    constexpr std::ptrdiff_t range = 0x2000;
+                    auto* start = reinterpret_cast<const uint8_t*>(insert) - range;
+                    if (start < reinterpret_cast<const uint8_t*>(ntdll))
+                        start = reinterpret_cast<const uint8_t*>(ntdll);
+                    auto* end_scan = reinterpret_cast<const uint8_t*>(insert) + range;
+                    if (end_scan > mod_end) end_scan = mod_end;
+                    for (auto* cur = start; cur + plen <= end_scan; ++cur)
+                        if (scanner::pattern_match(cur, s))
+                            return const_cast<uint8_t*>(cur);
+                }
+            }
+
+            return find_symbol_in_ntdll("RtlRemoveInvertedFunctionTable");
         }
 
         inline void* find_ldrp_release_tls_entry()
         {
-            constexpr std::array<const char*, 6> signatures = {
-#ifdef _WIN64
-                // Verified on Windows 11 24H2/25H2.
-                "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B 41 ? 48 8B",
-                "48 8B C4 48 89 58 ? 48 89 70 ? 57 48 83 EC ? 48 8B 41",
-                "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 48 8B",
-#else
-                // x86 patterns — best effort.
-                "8B FF 55 8B EC 51 56 8B 75 ? 57 8B",
-                "8B FF 55 8B EC 83 EC ? 53 56 8B 75 ? 57 8B",
-                "55 8B EC 83 EC ? 53 56 8B 75 ? 57 8B",
-#endif
-            };
-
             auto* ntdll = GetModuleHandleA("ntdll.dll");
-            for (const auto* sig : signatures)
+            if (!ntdll) return nullptr;
+
+            // Tier 1: proven internal pattern from NimRunPE / Blackbone / landaire.net
+            //   and   ecx, 7
+            //   shr   rdx, 3
+            // Located inside LdrpReleaseTlsEntry (bit-test for TLS index bitmap).
+            if (auto* r = find_func_by_internal_pattern("83 E1 07 48 C1 EA 03"))
+                return r;
+
+            // Tier 2: standard prologue patterns
             {
-                if (auto* result = scanner::find_in_module(ntdll, sig))
-                    return result;
+                constexpr std::array<const char*, 5> sigs = {
+                    "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B 41 ? 48 8B",
+                    "48 8B C4 48 89 58 ? 48 89 70 ? 57 48 83 EC ? 48 8B 41",
+                    "4C 8B DC 49 89 5B ? 49 89 73 ? 57 48 83 EC ? 48 8B",
+                    "48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 48 83 EC ? 48 8B 41",
+                    "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B 41",
+                };
+                for (const auto* s : sigs)
+                    if (auto* r = scanner::find_in_module(ntdll, s))
+                        return r;
             }
-            return nullptr;
+
+            return find_symbol_in_ntdll("LdrpReleaseTlsEntry");
         }
 
-        // ---- Trampoline: NtFreeVirtualMemory -> RtlExitUserThread (never returns to DLL) ----
+        // ---- Trampoline ----
 
 #ifdef _WIN64
-        // x64: MSVC does not support inline __asm. The trampoline is a raw byte array
-        // built by the self_unmap function on the caller's stack before a tail-call.
-        //
-        // The trampoline expects a context structure (aligned to 16 bytes):
-        //   [0x00] void*  image_base
-        //   [0x08] SIZE_T region_size (caller zeroes)
-        //   [0x10] void*  NtFreeVirtualMemory
-        //   [0x18] void*  RtlExitUserThread
-        //
-        // On entry, RCX = &context.
-        // The trampoline chains NtFreeVirtualMemory -> RtlExitUserThread on the stack
-        // by pushing RtlExitUserThread as the return address, then jmp'ing to NtFreeVirtualMemory.
-        // NtFreeVirtualMemory frees the DLL; RtlExitUserThread terminates the thread.
+        // x64: raw byte array trampoline. Uses callee-saved registers to survive
+        // across the NtFreeVirtualMemory call, then calls RtlExitUserThread(0).
         inline constexpr std::array<uint8_t, 45> kUnmapTrampolineX64{{
-                // mov rax, [rcx+0x10]     ; rax = NtFreeVirtualMemory
-                0x48, 0x8B, 0x41, 0x10,
-                // mov r10, [rcx+0x18]     ; r10 = RtlExitUserThread
-                0x4C, 0x8B, 0x51, 0x18,
-                // and rsp, -16            ; align stack
-                0x48, 0x83, 0xE4, 0xF0,
-                // sub rsp, 0x28           ; shadow space
-                0x48, 0x83, 0xEC, 0x28,
-                // push r10                ; RtlExitUserThread as return address for NtFreeVirtualMemory
-                0x41, 0x52,
-                // lea rdx, [rcx]          ; rdx = &image_base (context[0])
-                0x48, 0x8D, 0x11,
-                // lea r8, [rcx+0x08]      ; r8 = &region_size (context[1])
-                0x4C, 0x8D, 0x41, 0x08,
-                // mov r9d, 0x8000         ; r9 = MEM_RELEASE
-                0x41, 0xB9, 0x00, 0x80, 0x00, 0x00,
-                // or rcx, -1              ; rcx = GetCurrentProcess() pseudo-handle
-                0x48, 0x83, 0xC9, 0xFF,
-                // jmp rax                 ; tail-call NtFreeVirtualMemory
-                0xFF, 0xE0,
+            0x53,                                        // push rbx
+            0x57,                                        // push rdi
+            0x56,                                        // push rsi
+            0x48, 0x8B, 0x59, 0x10,                     // mov rbx, [rcx+0x10]
+            0x48, 0x8B, 0x79, 0x18,                     // mov rdi, [rcx+0x18]
+            0x48, 0x8B, 0xF1,                           // mov rsi, rcx
+            0x48, 0x83, 0xE4, 0xF0,                     // and rsp, -16
+            0x48, 0x83, 0xEC, 0x28,                     // sub rsp, 0x28
+            0x48, 0x83, 0xC9, 0xFF,                     // or rcx, -1
+            0x48, 0x8D, 0x16,                           // lea rdx, [rsi]
+            0x4C, 0x8D, 0x46, 0x08,                     // lea r8, [rsi+0x08]
+            0x41, 0xB9, 0x00, 0x80, 0x00, 0x00,         // mov r9d, 0x8000
+            0xFF, 0xD3,                                  // call rbx
+            0x33, 0xC9,                                  // xor ecx, ecx
+            0xFF, 0xD7,                                  // call rdi
         }};
 
-        [[noreturn]] inline void invoke_trampoline(void* base, void* nt_free_vm, void* rtl_exit_thread)
+        [[noreturn]] inline void invoke_trampoline(void* base, void* nt_free_vm, void* rtl_exit)
         {
             alignas(16) uint8_t ctx[32]{};
             *reinterpret_cast<void**>(ctx + 0x00) = base;
-            *reinterpret_cast<void**>(ctx + 0x08) = nullptr; // region_size = 0
+            *reinterpret_cast<void**>(ctx + 0x08) = nullptr;
             *reinterpret_cast<void**>(ctx + 0x10) = nt_free_vm;
-            *reinterpret_cast<void**>(ctx + 0x18) = rtl_exit_thread;
+            *reinterpret_cast<void**>(ctx + 0x18) = rtl_exit;
 
-            const auto trampoline =
-                    reinterpret_cast<void(NTAPI*)(void*)>(VirtualAlloc(
-                            nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-            if (!trampoline)
-                __fastfail(1);
-
-            std::memcpy(reinterpret_cast<void*>(trampoline), kUnmapTrampolineX64.data(),
-                        kUnmapTrampolineX64.size());
-
+            auto* trampoline = static_cast<void(NTAPI*)(void*)>(VirtualAlloc(
+                nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+            if (!trampoline) __fastfail(1);
+            std::memcpy(trampoline, kUnmapTrampolineX64.data(), kUnmapTrampolineX64.size());
             trampoline(ctx);
         }
 #else
-        // x86: MSVC supports inline __asm for stack-chain trampoline.
-        // On entry: [esp] = return addr (ignored), [esp+4] = base, [esp+8] = ntFreeVirtualMemory,
-        //           [esp+12] = rtlExitUserThread
-        // The function chains NtFreeVirtualMemory -> RtlExitUserThread on the stack
-        // and never returns to the DLL.
         __declspec(naked) void __stdcall invoke_trampoline_x86(
-                void* base, void* nt_free_vm, void* rtl_exit_thread)
+            void* base, void* nt_free_vm, void* rtl_exit)
         {
             __asm {
                 push ebp
                 mov ebp, esp
-                sub esp, 8                          // locals: [ebp-4] = base_copy, [ebp-8] = region_size(0)
+                sub esp, 8
                 xor eax, eax
-                mov [ebp-8], eax                    // region_size = 0
-                mov eax, [ebp+8]                    // base (arg 1)
-                mov [ebp-4], eax                    // base_copy
-
-                // Build NtFreeVirtualMemory stack frame with
-                // RtlExitUserThread as the return address.
-                push 0                              // ExitStatus for RtlExitUserThread
-                push 08000h                         // FreeType = MEM_RELEASE
-                lea eax, [ebp-8]
-                push eax                            // &RegionSize
-                lea eax, [ebp-4]
-                push eax                            // &BaseAddress
+                mov[ebp - 8], eax
+                mov eax, [ebp + 8]
+                mov[ebp - 4], eax
+                push 0
+                push 08000h
+                lea eax, [ebp - 8]
+                push eax
+                lea eax, [ebp - 4]
+                push eax
                 xor eax, eax
                 dec eax
-                push eax                            // ProcessHandle = -1
-                push [ebp+16]                       // RtlExitUserThread -> becomes NtFreeVirtualMemory ret addr
-
-                jmp [ebp+12]                        // tail-call NtFreeVirtualMemory
+                push eax
+                push[ebp + 16]
+                jmp[ebp + 12]
             }
         }
 
-        [[noreturn]] inline void invoke_trampoline(void* base, void* nt_free_vm, void* rtl_exit_thread)
+        [[noreturn]] inline void invoke_trampoline(void* base, void* nt_free_vm, void* rtl_exit)
         {
-            invoke_trampoline_x86(base, nt_free_vm, rtl_exit_thread);
+            invoke_trampoline_x86(base, nt_free_vm, rtl_exit);
         }
 #endif
 
-        // ---- Main self-unmap entry point ----
+        // ---- Main entry point ----
 
         [[noreturn]] inline void self_unmap(void* base)
         {
             const auto* dos = static_cast<const IMAGE_DOS_HEADER*>(base);
             const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-                    static_cast<const uint8_t*>(base) + dos->e_lfanew);
-
+                static_cast<const uint8_t*>(base) + dos->e_lfanew);
             const bool is_dll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
 
-            // 1. Call DllMain(DLL_PROCESS_DETACH) — reverse of attach order (Blackbone convention)
+            fprintf(stderr, "[yail::unmap] begin base=%p\n", base); fflush(stderr);
+
+            // 1. DllMain(DLL_PROCESS_DETACH)
+            fprintf(stderr, "[yail::unmap] step1: DllMain(DETACH)\n"); fflush(stderr);
             if (is_dll && nt->OptionalHeader.AddressOfEntryPoint)
             {
-                const auto entry_point = reinterpret_cast<BOOL(WINAPI*)(HMODULE, DWORD, LPVOID)>(
-                        static_cast<uint8_t*>(base) + nt->OptionalHeader.AddressOfEntryPoint);
-                entry_point(static_cast<HMODULE>(base), DLL_PROCESS_DETACH, nullptr);
+                auto ep = reinterpret_cast<BOOL(WINAPI*)(HMODULE, DWORD, LPVOID)>(
+                    static_cast<uint8_t*>(base) + nt->OptionalHeader.AddressOfEntryPoint);
+                ep(static_cast<HMODULE>(base), DLL_PROCESS_DETACH, nullptr);
             }
 
-            // 2. Call TLS callbacks with DLL_PROCESS_DETACH
+            // 2. TLS callbacks(DLL_PROCESS_DETACH)
             const auto& tls_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
             if (tls_dir.Size)
             {
-                const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(
-                        static_cast<const uint8_t*>(base) + tls_dir.VirtualAddress);
-                const auto* callbacks =
-                        reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks);
-                for (; callbacks && *callbacks; ++callbacks)
-                    (*callbacks)(base, DLL_PROCESS_DETACH, nullptr);
+                auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(
+                    static_cast<const uint8_t*>(base) + tls_dir.VirtualAddress);
+                auto* cbs = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks);
+                for (; cbs && *cbs; ++cbs)
+                    (*cbs)(base, DLL_PROCESS_DETACH, nullptr);
             }
 
-            // 3. Remove from inverted function table
-            if (const auto fn_remove = find_rtl_remove_inverted_function_table())
+            // 3. RtlRemoveInvertedFunctionTable
+            fprintf(stderr, "[yail::unmap] step3: RtlRemoveInvertedFunctionTable\n"); fflush(stderr);
+            if (auto* fn = find_rtl_remove_inverted_function_table())
             {
-                reinterpret_cast<RtlRemoveInvertedFunctionTableFn>(fn_remove)(base);
+                fprintf(stderr, "[yail::unmap]   -> found at %p\n", fn); fflush(stderr);
+                reinterpret_cast<RtlRemoveInvertedFunctionTableFn>(fn)(base);
+            }
+            else
+            {
+                fprintf(stderr, "[yail::unmap]   -> NOT FOUND\n"); fflush(stderr);
             }
 
-            // 4. Deregister static TLS
+            // 4. LdrpReleaseTlsEntry
+            fprintf(stderr, "[yail::unmap] step4: LdrpReleaseTlsEntry\n"); fflush(stderr);
             if (tls_dir.Size)
             {
-                if (const auto fn_release_tls = find_ldrp_release_tls_entry())
+                if (auto* fn = find_ldrp_release_tls_entry())
                 {
-                    LdrDataTableEntryFull fake_entry{};
-                    auto* raw = reinterpret_cast<volatile uint8_t*>(&fake_entry);
-                    for (std::size_t i = 0; i < sizeof(fake_entry); ++i)
-                        raw[i] = 0;
-
-                    fake_entry.dll_base = base;
-                    fake_entry.size_of_image = nt->OptionalHeader.SizeOfImage;
-                    fake_entry.entry_point =
-                            static_cast<uint8_t*>(base) + nt->OptionalHeader.AddressOfEntryPoint;
-
-                    fake_entry.in_load_order_links.Flink = &fake_entry.in_load_order_links;
-                    fake_entry.in_load_order_links.Blink = &fake_entry.in_load_order_links;
-                    fake_entry.in_memory_order_links.Flink = &fake_entry.in_memory_order_links;
-                    fake_entry.in_memory_order_links.Blink = &fake_entry.in_memory_order_links;
-                    fake_entry.in_initialization_order_links.Flink =
-                            &fake_entry.in_initialization_order_links;
-                    fake_entry.in_initialization_order_links.Blink =
-                            &fake_entry.in_initialization_order_links;
-                    fake_entry.hash_links.Flink = &fake_entry.hash_links;
-                    fake_entry.hash_links.Blink = &fake_entry.hash_links;
-
-#ifdef _WIN64
-                    reinterpret_cast<LdrpReleaseTlsEntryFn>(fn_release_tls)(&fake_entry, nullptr);
-#else
-                    reinterpret_cast<LdrpReleaseTlsEntryFn>(fn_release_tls)(&fake_entry, nullptr);
-#endif
+                    fprintf(stderr, "[yail::unmap]   -> found at %p\n", fn); fflush(stderr);
+                    LdrDataTableEntryFull fake{};
+                    auto* raw = reinterpret_cast<volatile uint8_t*>(&fake);
+                    for (std::size_t i = 0; i < sizeof(fake); ++i) raw[i] = 0;
+                    fake.dll_base = base;
+                    fake.size_of_image = nt->OptionalHeader.SizeOfImage;
+                    fake.entry_point = static_cast<uint8_t*>(base)
+                                       + nt->OptionalHeader.AddressOfEntryPoint;
+                    fake.in_load_order_links.Flink = &fake.in_load_order_links;
+                    fake.in_load_order_links.Blink = &fake.in_load_order_links;
+                    fake.in_memory_order_links.Flink = &fake.in_memory_order_links;
+                    fake.in_memory_order_links.Blink = &fake.in_memory_order_links;
+                    fake.in_initialization_order_links.Flink = &fake.in_initialization_order_links;
+                    fake.in_initialization_order_links.Blink = &fake.in_initialization_order_links;
+                    fake.hash_links.Flink = &fake.hash_links;
+                    fake.hash_links.Blink = &fake.hash_links;
+                    reinterpret_cast<LdrpReleaseTlsEntryFn>(fn)(&fake, nullptr);
+                }
+                else
+                {
+                    fprintf(stderr, "[yail::unmap]   -> NOT FOUND\n"); fflush(stderr);
                 }
             }
+            else
+            {
+                fprintf(stderr, "[yail::unmap]   -> no TLS directory\n"); fflush(stderr);
+            }
 
-            // 5. Free DLL memory and terminate thread
-            // NtFreeVirtualMemory and RtlExitUserThread are in ntdll, fixed per boot session.
+            // 5. Free and exit
+            fprintf(stderr, "[yail::unmap] step5: free and exit\n"); fflush(stderr);
             auto* ntdll = GetModuleHandleA("ntdll.dll");
-            auto* nt_free_vm = GetProcAddress(ntdll, "NtFreeVirtualMemory");
-            auto* rtl_exit = GetProcAddress(ntdll, "RtlExitUserThread");
-
-            if (!nt_free_vm || !rtl_exit)
-                __fastfail(2);
-
-            invoke_trampoline(base, nt_free_vm, rtl_exit);
+            auto* ntfv = GetProcAddress(ntdll, "NtFreeVirtualMemory");
+            auto* reut = GetProcAddress(ntdll, "RtlExitUserThread");
+            if (!ntfv || !reut) __fastfail(2);
+            invoke_trampoline(base, ntfv, reut);
         }
     } // namespace detail_unmap
 
-    // Public API — call this from your injected DLL.
-    // base: the HMODULE/hInstance received in DllMain(DLL_PROCESS_ATTACH).
-    // This function never returns — it frees the DLL and terminates the thread.
     [[noreturn]] inline void self_unmap(void* base)
     {
         detail_unmap::self_unmap(base);

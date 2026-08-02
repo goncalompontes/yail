@@ -555,19 +555,13 @@ static bool TestDelayImportWinmm()
 // =========================================================================
 static bool TestSelfUnmap()
 {
-    // Verify RtlRemoveInvertedFunctionTable can be found on this system.
-    const auto* ntdll = GetModuleHandleA("ntdll.dll");
-    (void)ntdll; // used by the implicit test below
+    auto* ntdll = GetModuleHandleA("ntdll.dll");
+    (void)ntdll;
 
-    // Verify NtFreeVirtualMemory and RtlExitUserThread are exported.
     if (!GetProcAddress(ntdll, "NtFreeVirtualMemory"))
         return false;
     if (!GetProcAddress(ntdll, "RtlExitUserThread"))
         return false;
-
-    // yail::self_unmap(base) is declared [[noreturn]] and will free this DLL
-    // and terminate the calling thread when invoked. Call it from your plugin
-    // when you are ready to unload:  yail::self_unmap(hModule);
 
     return true;
 }
