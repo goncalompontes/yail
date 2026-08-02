@@ -54,6 +54,8 @@ struct RemoteLoaderData final
     decltype(&VirtualProtect) fn_virtual_protect;
     void* fn_ldrp_handle_tls_data;
     void* fn_rtl_insert_inverted_function_table;
+    decltype(&GetProcessHeap) fn_get_process_heap;
+    void* fn_rtl_allocate_heap; // RtlAllocateHeap (PVOID NTAPI RtlAllocateHeap(HANDLE, ULONG, SIZE_T))
 };
 
 struct FunctionSizeResult
@@ -408,30 +410,43 @@ DWORD WINAPI remote_shellcode(const RemoteLoaderData* data)
     const auto& tls_directory = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (tls_directory.Size && data->fn_ldrp_handle_tls_data)
     {
-        // Build fake LDR_DATA_TABLE_ENTRY on the stack - zero without memset.
-        LdrDataTableEntryFull entry;
-        auto* raw = reinterpret_cast<volatile uint8_t*>(&entry);
-        for (size_t i = 0; i < sizeof(entry); i++)
-            raw[i] = 0;
+        if (data->fn_get_process_heap && data->fn_rtl_allocate_heap)
+        {
+            const HANDLE heap = data->fn_get_process_heap();
+            auto* entry = reinterpret_cast<LdrDataTableEntryFull*>(
+                    reinterpret_cast<PVOID(NTAPI*)(HANDLE, ULONG, SIZE_T)>(
+                            data->fn_rtl_allocate_heap)(heap, HEAP_ZERO_MEMORY,
+                                                        sizeof(LdrDataTableEntryFull)));
 
-        entry.dll_base = base;
-        entry.size_of_image = nt_headers->OptionalHeader.SizeOfImage;
-        entry.entry_point = base + nt_headers->OptionalHeader.AddressOfEntryPoint;
+            if (entry)
+            {
+                entry->dll_base = base;
+                entry->size_of_image = nt_headers->OptionalHeader.SizeOfImage;
+                entry->entry_point = base + nt_headers->OptionalHeader.AddressOfEntryPoint;
 
-        entry.in_load_order_links.Flink = &entry.in_load_order_links;
-        entry.in_load_order_links.Blink = &entry.in_load_order_links;
-        entry.in_memory_order_links.Flink = &entry.in_memory_order_links;
-        entry.in_memory_order_links.Blink = &entry.in_memory_order_links;
-        entry.in_initialization_order_links.Flink = &entry.in_initialization_order_links;
-        entry.in_initialization_order_links.Blink = &entry.in_initialization_order_links;
-        entry.hash_links.Flink = &entry.hash_links;
-        entry.hash_links.Blink = &entry.hash_links;
+                entry->in_load_order_links.Flink = &entry->in_load_order_links;
+                entry->in_load_order_links.Blink = &entry->in_load_order_links;
+                entry->in_memory_order_links.Flink = &entry->in_memory_order_links;
+                entry->in_memory_order_links.Blink = &entry->in_memory_order_links;
+                entry->in_initialization_order_links.Flink = &entry->in_initialization_order_links;
+                entry->in_initialization_order_links.Blink = &entry->in_initialization_order_links;
+                entry->hash_links.Flink = &entry->hash_links;
+                entry->hash_links.Blink = &entry->hash_links;
 
 #ifdef _WIN64
-        (reinterpret_cast<NTSTATUS(NTAPI*)(LdrDataTableEntryFull*)>(data->fn_ldrp_handle_tls_data)(&entry));
+                (reinterpret_cast<NTSTATUS(NTAPI*)(LdrDataTableEntryFull*)>(
+                        data->fn_ldrp_handle_tls_data)(entry));
 #else
-        (reinterpret_cast<NTSTATUS(__fastcall*)(LdrDataTableEntryFull*)>(data->fn_ldrp_handle_tls_data)(&entry));
+                (reinterpret_cast<NTSTATUS(__fastcall*)(LdrDataTableEntryFull*)>(
+                        data->fn_ldrp_handle_tls_data)(entry));
 #endif
+
+                // Stash the heap pointer at a known offset so self_unmap
+                // can pass the exact same pointer to LdrpReleaseTlsEntry.
+                *reinterpret_cast<LdrDataTableEntryFull**>(
+                        base + sizeof(IMAGE_DOS_HEADER)) = entry;
+            }
+        }
     }
 
     // --- Apply per-section memory protections ---

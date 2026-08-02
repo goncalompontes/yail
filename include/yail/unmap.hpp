@@ -205,27 +205,24 @@ namespace yail
             if (auto* fn = find_rtl_remove_inverted_function_table())
                 reinterpret_cast<RtlRemoveInvertedFunctionTableFn>(fn)(base);
 
-            // 4. LdrpReleaseTlsEntry
-            if (tls_dir.Size)
+            // 4. LdrpReleaseTlsEntry — use the persistent heap pointer
+            // stashed by the injection shellcode at base + sizeof(IMAGE_DOS_HEADER).
+            if (auto* fn = find_ldrp_release_tls_entry())
             {
-                if (auto* fn = find_ldrp_release_tls_entry())
+                auto** stash = reinterpret_cast<LdrDataTableEntryFull**>(
+                        static_cast<uint8_t*>(base) + sizeof(IMAGE_DOS_HEADER));
+
+                if (tls_dir.Size && *stash)
                 {
-                    LdrDataTableEntryFull fake{};
-                    auto* raw = reinterpret_cast<volatile uint8_t*>(&fake);
-                    for (std::size_t i = 0; i < sizeof(fake); ++i) raw[i] = 0;
-                    fake.dll_base = base;
-                    fake.size_of_image = nt->OptionalHeader.SizeOfImage;
-                    fake.entry_point = static_cast<uint8_t*>(base)
-                                       + nt->OptionalHeader.AddressOfEntryPoint;
-                    fake.in_load_order_links.Flink = &fake.in_load_order_links;
-                    fake.in_load_order_links.Blink = &fake.in_load_order_links;
-                    fake.in_memory_order_links.Flink = &fake.in_memory_order_links;
-                    fake.in_memory_order_links.Blink = &fake.in_memory_order_links;
-                    fake.in_initialization_order_links.Flink = &fake.in_initialization_order_links;
-                    fake.in_initialization_order_links.Blink = &fake.in_initialization_order_links;
-                    fake.hash_links.Flink = &fake.hash_links;
-                    fake.hash_links.Blink = &fake.hash_links;
-                    reinterpret_cast<LdrpReleaseTlsEntryFn>(fn)(&fake, nullptr);
+                    reinterpret_cast<LdrpReleaseTlsEntryFn>(fn)(*stash, nullptr);
+
+                    // Free the persistent heap allocation.
+                    auto* ntdll = GetModuleHandleA("ntdll.dll");
+                    auto heap = GetProcessHeap();
+                    auto rtlFree = reinterpret_cast<BOOLEAN(NTAPI*)(HANDLE, ULONG, PVOID)>(
+                            GetProcAddress(ntdll, "RtlFreeHeap"));
+                    if (rtlFree)
+                        rtlFree(heap, 0, *stash);
                 }
             }
 

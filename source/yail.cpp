@@ -141,6 +141,9 @@ namespace yail
         loader_data.fn_rtl_add_function_table = RtlAddFunctionTable;
 #endif
         loader_data.fn_virtual_protect = VirtualProtect;
+        loader_data.fn_get_process_heap = GetProcessHeap;
+        loader_data.fn_rtl_allocate_heap =
+                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAllocateHeap"));
         const auto tls_fn = detail::find_ldrp_handle_tls_data();
         if (!tls_fn)
             return fail_image(tls_fn.error());

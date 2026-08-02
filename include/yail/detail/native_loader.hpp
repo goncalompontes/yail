@@ -24,6 +24,8 @@ namespace yail::detail
         decltype(&VirtualProtect) fn_virtual_protect;
         void* fn_ldrp_handle_tls_data;
         void* fn_rtl_insert_inverted_function_table;
+        decltype(&GetProcessHeap) fn_get_process_heap;
+        void* fn_rtl_allocate_heap;
     };
 
     [[nodiscard]]
