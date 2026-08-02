@@ -70,6 +70,10 @@ if (YAIL_BUILD_EXAMPLES)
     add_executable(test_cycle examples/test_cycle.cpp)
     set_target_properties(test_cycle PROPERTIES CXX_STANDARD 23)
     target_link_libraries(test_cycle PRIVATE yail)
+
+    # Diagnostic tool for identifying unexported functions
+    add_executable(diagnose_unmap tools/diagnose_unmap.cpp)
+    set_target_properties(diagnose_unmap PROPERTIES CXX_STANDARD 23)
 endif()
 
 
